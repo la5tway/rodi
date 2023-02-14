@@ -2,8 +2,17 @@ import inspect
 import re
 import sys
 from collections import defaultdict
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager
 from enum import Enum
-from inspect import Signature, _empty, isabstract, isclass, iscoroutinefunction
+from inspect import (
+    Signature,
+    _empty,
+    isabstract,
+    isclass,
+    iscoroutinefunction,
+    isasyncgenfunction,
+    isawaitable,
+)
 from typing import (
     Any,
     Callable,
@@ -227,7 +236,7 @@ def _get_factory_annotations_or_throw(factory: Any):
 
 
 class ActivationScope:
-    __slots__ = ("scoped_services", "provider")
+    __slots__ = ("scoped_services", "provider", "exit_stack")
 
     def __init__(
         self,
@@ -236,6 +245,7 @@ class ActivationScope:
     ):
         self.provider = provider
         self.scoped_services = scoped_services or {}
+        self.exit_stack = AsyncExitStack()
 
     def __enter__(self):
         if self.scoped_services is None:
@@ -319,6 +329,23 @@ class ArgsTypeProvider:
         return self._type(*[fn(context, self._type) for fn in self._args_callbacks])
 
 
+class AsyncArgsTypeProvider:
+    __slots__ = ("_type", "_args_callbacks")
+
+    def __init__(self, _type, args_callbacks):
+        self._type = _type
+        self._args_callbacks = args_callbacks
+
+    async def __call__(self, context, parent_type):
+        args = []
+        for fn in self._args_callbacks:
+            value = fn(context, self._type)
+            if isawaitable(value):
+                value = await value
+            args.append(value)
+        return self._type(*args) if args else self._type()
+
+
 class FactoryTypeProvider:
     __slots__ = ("_type", "factory")
 
@@ -391,6 +418,41 @@ class AsyncScopedFactoryTypeProvider:
         return instance
 
 
+class AsyncSingletonCMFactoryTypeProvider:
+    __slots__ = ("_type", "factory", "instance")
+
+    def __init__(self, type_, factory):
+        self._type = type_
+        self.factory = asynccontextmanager(factory)
+        self.instance = None
+
+    async def __call__(self, context: ActivationScope, parent_type):
+        if self.instance is None:
+            # self.instance = await self.factory(context, parent_type)
+            self.instance = await context.exit_stack.enter_async_context(
+                self.factory(context, parent_type)
+            )
+        return self.instance
+
+
+class AsyncScopedCMFactoryTypeProvider:
+    __slots__ = ("_type", "factory")
+
+    def __init__(self, type_, factory):
+        self._type = type_
+        self.factory = asynccontextmanager(factory)
+
+    async def __call__(self, context: ActivationScope, parent_type: type):
+        if self._type in context.scoped_services:
+            return context.scoped_services[self._type]  # type: ignore
+
+        instance = await context.exit_stack.enter_async_context(
+            self.factory(context, parent_type)
+        )
+        context.scoped_services[self._type] = instance  # type: ignore
+        return instance
+
+
 class ScopedArgsTypeProvider:
     __slots__ = ("_type", "_args_callbacks")
 
@@ -403,6 +465,29 @@ class ScopedArgsTypeProvider:
             return context.scoped_services[self._type]  # type: ignore
 
         service = self._type(*[fn(context, self._type) for fn in self._args_callbacks])
+        context.scoped_services[self._type] = service  # type: ignore
+        return service
+
+
+class AsyncScopedTypeProvider:
+    __slots__ = ("_type", "_args_callbacks")
+
+    def __init__(self, _type, args_callbacks):
+        self._type = _type
+        self._args_callbacks = args_callbacks
+
+    async def __call__(self, context: ActivationScope, parent_type):
+        if self._type in context.scoped_services:
+            return context.scoped_services[self._type]  # type: ignore
+
+        args = []
+        for fn in self._args_callbacks:
+            value = fn(context, self._type)
+            if isawaitable(value):
+                value = await value
+            args.append(value)
+        service = self._type(*args) if args else self._type()
+
         context.scoped_services[self._type] = service  # type: ignore
         return service
 
@@ -426,17 +511,56 @@ class SingletonTypeProvider:
         return self._instance
 
 
+class AsyncSingletonTypeProvider:
+    __slots__ = ("_type", "_instance", "_args_callbacks")
+
+    def __init__(self, _type, _args_callbacks):
+        self._type = _type
+        self._args_callbacks = _args_callbacks
+        self._instance = None
+
+    async def __call__(self, context, parent_type):
+        if not self._instance:
+            args = []
+            for fn in self._args_callbacks:
+                value = fn(context, self._type)
+                if isawaitable(value):
+                    value = await value
+                args.append(value)
+            self._instance = self._type(*args) if args else self._type()
+
+        return self._instance
+
+
 def get_annotations_type_provider(
     concrete_type: Type[Any],
     resolvers: Mapping[str, Callable],
     life_style: ServiceLifeStyle,
     resolver_context: ResolutionContext,
 ):
-    def factory(context, parent_type):
-        instance = concrete_type()
-        for name, resolver in resolvers.items():
-            setattr(instance, name, resolver(context, parent_type))
-        return instance
+    is_async = False
+    for resolver in resolvers.values():
+        if iscoroutinefunction(resolver):
+            is_async = True
+            break
+    if is_async:
+
+        async def factory(context, parent_type):
+            instance = concrete_type()
+            for name, resolver in resolvers.items():
+                value = resolver(context, parent_type)
+                if isawaitable(value):
+                    value = await value
+                setattr(instance, name, value)
+            return instance
+
+    else:
+
+        def factory(context, parent_type):
+            instance = concrete_type()
+            for name, resolver in resolvers.items():
+                setattr(instance, name, resolver(context, parent_type))
+            return instance
 
     return FactoryResolver(concrete_type, factory, life_style)(resolver_context)
 
@@ -505,6 +629,7 @@ class DynamicResolver:
     ):
         fns = []
         services = self.services
+        exists_async = False
 
         for param_name, param in params.items():
             if param_name == "self":
@@ -542,7 +667,9 @@ class DynamicResolver:
 
             param_resolver = self._get_resolver(param_type, context)
             fns.append(param_resolver)
-        return fns
+            if iscoroutinefunction(param_resolver.__call__):
+                exists_async = True
+        return fns, exists_async
 
     def _resolve_by_init_method(self, context: ResolutionContext):
         sig = Signature.from_callable(self.concrete_type.__init__)
@@ -573,8 +700,16 @@ class DynamicResolver:
 
             return TypeProvider(concrete_type)
 
-        fns = self._get_resolvers_for_parameters(concrete_type, context, params)
+        fns, exists_async = self._get_resolvers_for_parameters(
+            concrete_type, context, params
+        )
 
+        if exists_async:
+            if self.life_style is ServiceLifeStyle.SINGLETON:
+                return AsyncSingletonTypeProvider(concrete_type, fns)
+            if self.life_style is ServiceLifeStyle.SCOPED:
+                return AsyncScopedTypeProvider(concrete_type, fns)
+            return AsyncArgsTypeProvider(concrete_type, fns)
         if self.life_style == ServiceLifeStyle.SINGLETON:
             return SingletonTypeProvider(concrete_type, fns)
 
@@ -589,7 +724,7 @@ class DynamicResolver:
         params = {key: Dependency(key, value) for key, value in annotations.items()}
         concrete_type = self.concrete_type
 
-        fns = self._get_resolvers_for_parameters(concrete_type, context, params)
+        fns, _ = self._get_resolvers_for_parameters(concrete_type, context, params)
         resolvers = {}
 
         i = 0
@@ -639,9 +774,18 @@ class FactoryResolver:
         self.life_style = life_style
 
     def __call__(self, context: ResolutionContext):
-        factory = self.factory
-        while hasattr(factory, "factory"):
-            factory = factory.factory
+        factory = self._unwrap(self.factory)
+        if isasyncgenfunction(factory):
+            if self.life_style is ServiceLifeStyle.SINGLETON:
+                return AsyncSingletonCMFactoryTypeProvider(
+                    self.concrete_type,
+                    self.factory,
+                )
+            if self.life_style is ServiceLifeStyle.SCOPED:
+                return AsyncScopedCMFactoryTypeProvider(
+                    self.concrete_type,
+                    self.factory,
+                )
         if iscoroutinefunction(factory):
             if self.life_style is ServiceLifeStyle.SINGLETON:
                 return AsyncSingletonFactoryTypeProvider(
@@ -653,20 +797,24 @@ class FactoryResolver:
                     self.concrete_type,
                     self.factory,
                 )
-        else:
-            if self.life_style == ServiceLifeStyle.SINGLETON:
-                return SingletonFactoryTypeProvider(
-                    self.concrete_type,
-                    self.factory,
-                )
+        if self.life_style == ServiceLifeStyle.SINGLETON:
+            return SingletonFactoryTypeProvider(
+                self.concrete_type,
+                self.factory,
+            )
 
-            if self.life_style == ServiceLifeStyle.SCOPED:
-                return ScopedFactoryTypeProvider(
-                    self.concrete_type,
-                    self.factory,
-                )
+        if self.life_style == ServiceLifeStyle.SCOPED:
+            return ScopedFactoryTypeProvider(
+                self.concrete_type,
+                self.factory,
+            )
 
         return FactoryTypeProvider(self.concrete_type, self.factory)
+
+    def _unwrap(self, factory):
+        while hasattr(factory, "factory"):
+            factory = factory.factory
+        return factory
 
 
 first_cap_re = re.compile("(.)([A-Z][a-z]+)")
@@ -749,6 +897,27 @@ class Services:
             raise CannotResolveTypeException(desired_type)
 
         return cast(T, resolver(scope, desired_type))
+
+    async def get_async(
+        self,
+        desired_type: Union[Type[T], str],
+        scope: Optional[ActivationScope] = None,
+        *,
+        default: Optional[Any] = ...,
+    ) -> T:
+        if scope is None:
+            scope = ActivationScope(self)
+
+        resolver = self._map.get(desired_type)
+
+        if not resolver:
+            if default is not ...:
+                return cast(T, default)
+            raise CannotResolveTypeException(desired_type)
+        value = resolver(scope, desired_type)
+        if isawaitable(value):
+            value = await value
+        return cast(T, value)
 
     def _get_getter(self, key: Union[Type[Any], str], param: Dependency):
         if param.annotation is _empty:
@@ -915,6 +1084,15 @@ class Container(ContainerProtocol):
         Resolves a service by Type[Any], obtaining an instance of that type.
         """
         return self.provider.get(obj_type, scope=scope)
+
+    async def resolve_async(
+        self,
+        obj_type: Union[Type[T], str],
+        scope: Any = None,
+        *args,
+        **kwargs,
+    ) -> T:
+        return await self.provider.get_async(obj_type, scope=scope)
 
     def add_alias(self, name: str, desired_type: Type[Any]):
         """
@@ -1211,3 +1389,73 @@ class Container(ContainerProtocol):
             return _map[_type]
         except KeyError:
             raise AliasConfigurationError(name, _type)
+
+
+if __name__ == "__main__":
+    from asyncio import run
+    from dataclasses import dataclass
+
+    @dataclass
+    class Test:
+        from_: str
+
+    @dataclass
+    class TestIter(Test):
+        ...
+
+    @dataclass
+    class TestIter2:
+        test_iter: TestIter
+
+    async def get_async_direct():
+        print("call get_async_direct")
+        return Test("async direct")
+
+    async def get_async_iter():
+        print("call get_async_iter")
+        yield TestIter("async iter")
+
+    async def test():
+        container = Container()
+        container.add_scoped_by_factory(get_async_direct, Test)
+        container.add_scoped_by_factory(get_async_iter, TestIter)
+        container.add_scoped(TestIter2)
+        scope = ActivationScope(container)
+        # test = container.resolve(Test, scope)
+        # if inspect.isawaitable(test):
+        #     test = await test
+        # print(test)
+        # test = container.resolve(Test, scope)
+        # if inspect.isawaitable(test):
+        #     test = await test
+        # print(test)
+        # test_iter = container.resolve(TestIter, scope)
+        # if inspect.isawaitable(test_iter):
+        #     test_iter = await test_iter
+        # print(test_iter)
+        # test_iter = container.resolve(TestIter, scope)
+        # if inspect.isawaitable(test_iter):
+        #     test_iter = await test_iter
+        # print(test_iter)
+        # test_iter = container.resolve(TestIter, scope)
+        # if inspect.isawaitable(test_iter):
+        #     test_iter = await test_iter
+        # print(test_iter)
+        # test_iter2 = container.resolve(TestIter2, scope)
+        # if inspect.isawaitable(test_iter2):
+        #     test_iter2 = await test_iter2
+        # print(test_iter2)
+        test = await container.resolve_async(Test, scope)
+        print(test)
+        test = await container.resolve_async(Test, scope)
+        print(test)
+        test_iter = await container.resolve_async(TestIter, scope)
+        print(test_iter)
+        test_iter = await container.resolve_async(TestIter, scope)
+        print(test_iter)
+        test_iter = await container.resolve_async(TestIter, scope)
+        print(test_iter)
+        test_iter2 = await container.resolve_async(TestIter2, scope)
+        print(test_iter2)
+
+    run(test())
