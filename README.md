@@ -27,7 +27,7 @@ The `ContainerProtocol` for v2 is inspired by [punq](https://github.com/bobthemi
 ## Installation
 
 ```bash
-pip install rodi
+pip install git+https://github.com/la5tway/rodi.git@add_async_providers
 ```
 
 ## Efficient
