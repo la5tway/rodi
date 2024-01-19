@@ -52,3 +52,29 @@ path = "rodi/__about__.py"
 [project.urls]
 "Homepage" = "https://github.com/Neoteroi/rodi"
 "Bug Tracker" = "https://github.com/Neoteroi/rodi/issues"
+
+[tool.ruff]
+line-length = 88
+extend-select = [
+  "AIR",
+  "B",
+  "BLE",
+  "C90",
+  "C4",
+  "FLY",
+  "I",
+  "ICN",
+  "ISC",
+  "PERF",
+  "PIE",
+  "PYI",
+  "Q",
+  "SIM",
+  "UP",
+  "W",
+  "YTT",
+  "T20",
+]
+extend-exclude = [
+  ".venv"
+]
