@@ -20,27 +20,29 @@ from pytest import raises
 
 from rodi import (
     ActivationScope,
+    Container,
+    ContainerProtocol,
+    Services,
+    inject,
+)
+from rodi.annotations import get_factory_annotations_or_throw
+from rodi.common import to_standard_param_name
+from rodi.constants import ServiceLifeStyle
+from rodi.exceptions import (
     AliasAlreadyDefined,
     AliasConfigurationError,
     CannotResolveParameterException,
     CannotResolveTypeException,
     CircularDependencyException,
-    Container,
-    ContainerProtocol,
-    DynamicResolver,
     FactoryMissingContextException,
-    InstanceResolver,
     InvalidFactory,
     InvalidOperationInStrictMode,
     MissingTypeException,
     OverridingServiceException,
-    ServiceLifeStyle,
-    Services,
     UnsupportedUnionTypeException,
-    _get_factory_annotations_or_throw,
-    inject,
-    to_standard_param_name,
 )
+from rodi.resolvers.dynamic import DynamicResolver
+from rodi.resolvers.instance import InstanceResolver
 from tests.examples import (
     A,
     B,
@@ -2326,7 +2328,7 @@ def test_factory_without_locals_raises():
         ...
 
     with pytest.raises(FactoryMissingContextException):
-        _get_factory_annotations_or_throw(factory_without_context)
+        get_factory_annotations_or_throw(factory_without_context)
 
 
 def test_factory_with_locals_get_annotations():
@@ -2334,7 +2336,7 @@ def test_factory_with_locals_get_annotations():
     def factory_without_context() -> "Cat":
         ...
 
-    annotations = _get_factory_annotations_or_throw(factory_without_context)
+    annotations = get_factory_annotations_or_throw(factory_without_context)
 
     assert annotations["return"] is Cat
 
