@@ -8,7 +8,6 @@ from inspect import (
 )
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Mapping, get_type_hints
 
-from rodi.annotations import get_annotations_type_provider
 from rodi.common import (
     Dependency,
     class_name,
@@ -23,6 +22,7 @@ from rodi.exceptions import (
     CircularDependencyException,
     UnsupportedUnionTypeException,
 )
+from rodi.providers.factory import get_annotations_type_provider
 from rodi.providers.scoped import (
     AsyncScopedArgsTypeProvider,
     AsyncScopedArgsTypeProviderExplicit,
