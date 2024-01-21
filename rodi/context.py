@@ -24,6 +24,7 @@ class ActivationScope:
         self.astack = AsyncExitStack()
 
     def __enter__(self) -> "ActivationScope":
+        self.stack.__enter__()
         return self
 
     def __exit__(
@@ -32,9 +33,12 @@ class ActivationScope:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
+        self.stack.__exit__(exc_type, exc_val, exc_tb)
         self.dispose()
 
     async def __aenter__(self) -> "ActivationScope":
+        self.stack.__enter__()
+        await self.astack.__aenter__()
         return self
 
     async def __aexit__(
@@ -43,6 +47,8 @@ class ActivationScope:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
+        self.stack.__exit__(exc_type, exc_val, exc_tb)
+        await self.astack.__aexit__(exc_type, exc_val, exc_tb)
         self.dispose()
 
     def get(
